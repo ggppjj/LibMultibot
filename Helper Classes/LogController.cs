@@ -6,13 +6,13 @@ using Serilog.Events;
 
 namespace LibMultibot.Helper_Classes;
 
-internal class LogController
+public class LogController
 {
     private static readonly Lock _lock = new();
     private static bool _isInitialized = false;
     private static LoggingLevelSwitch? _levelSwitch;
 
-    internal static ILogger SetupLogging(
+    public static ILogger SetupLogging(
         Type contextType,
         IConfigurationRoot? localApplicationConfig = null
     )

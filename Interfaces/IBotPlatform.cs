@@ -1,6 +1,6 @@
 ﻿namespace LibMultibot.Interfaces;
 
-internal interface IBotPlatform
+public interface IBotPlatform
 {
     string Name { get; }
     IBot Bot { get; }

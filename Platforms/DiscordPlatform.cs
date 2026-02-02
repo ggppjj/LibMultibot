@@ -16,7 +16,7 @@ internal partial class TokenJsonContext : JsonSerializerContext { }
 
 public delegate void CommandEventHandler(object? sender, EventArgs? e);
 
-internal class DiscordPlatform : IBotPlatform
+public class DiscordPlatform : IBotPlatform
 {
     public string Name { get; } = "Discord";
     public IBot Bot { get; }
@@ -34,7 +34,7 @@ internal class DiscordPlatform : IBotPlatform
 
     public event CommandEventHandler? OnCommand;
 
-    internal DiscordPlatform(IBot bot)
+    public DiscordPlatform(IBot bot)
     {
         Bot = bot;
         _logger = LogController.SetupLogging(typeof(DiscordPlatform));
