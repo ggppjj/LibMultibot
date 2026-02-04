@@ -6,4 +6,5 @@ public interface IBotPlatform
     IBot Bot { get; }
     List<IBotCommand> Commands { get; }
     Task Shutdown();
+    bool IsActive { get; set; }
 }

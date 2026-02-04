@@ -7,4 +7,5 @@ public interface IBot
     void OnCommand(string message);
     Task<bool> Init();
     Task Shutdown();
+    bool IsActive { get; set; }
 }

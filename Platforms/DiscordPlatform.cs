@@ -31,6 +31,7 @@ public class DiscordPlatform : IBotPlatform
     private readonly ApplicationCommandService<SlashCommandContext> _commandService;
     private readonly ILogger _logger;
     private readonly string? _token;
+    public bool IsActive { get; set; } = true;
 
     public event CommandEventHandler? OnCommand;
 
@@ -108,7 +109,7 @@ public class DiscordPlatform : IBotPlatform
 
     private async Task HandleInteractionAsync(Interaction interaction)
     {
-        if (interaction is not SlashCommandInteraction slashCommand)
+        if (interaction is not SlashCommandInteraction slashCommand || !IsActive)
             return;
 
         try
@@ -247,7 +248,7 @@ public class DiscordPlatform : IBotPlatform
 
     private async Task HandleMessageAsync(Message message)
     {
-        if (message.Author.IsBot || !message.Content.StartsWith('!'))
+        if (message.Author.IsBot || !message.Content.StartsWith('!') || !IsActive)
             return;
 
         try
