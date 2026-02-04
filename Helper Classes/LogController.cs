@@ -103,7 +103,6 @@ public class LogController
                 StartHeartbeat();
             }
         }
-
         return Log.Logger.ForContext(contextType);
     }
 
@@ -123,6 +122,8 @@ public class LogController
 
     private static void StartHeartbeat()
     {
+        var heartbeatLogger = Log.Logger.ForContext("SourceContext", "HEARTBEAT");
+
         var now = DateTime.Now;
         var nextHour = now.Date.AddHours(now.Hour + 1);
         var delay = nextHour - now;
@@ -131,7 +132,7 @@ public class LogController
         timer.Elapsed += (s, e) =>
         {
             timer.Interval = TimeSpan.FromHours(1).TotalMilliseconds;
-            Log.Information("{Lyric}", _lyrics[_lyricIndex]);
+            heartbeatLogger.Information("{Lyric}", _lyrics[_lyricIndex]);
             _lyricIndex = (_lyricIndex + 1) % _lyrics.Length;
         };
         timer.Start();
