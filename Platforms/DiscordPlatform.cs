@@ -8,7 +8,6 @@ using NetCord.Gateway;
 using NetCord.Rest;
 using NetCord.Services.ApplicationCommands;
 using Serilog;
-using Serilog.Filters;
 
 namespace LibMultibot.Platforms;
 
@@ -161,7 +160,13 @@ public class DiscordPlatform : IBotPlatform
                 || !string.IsNullOrEmpty(matchingCommand.Response.EmbedDescription)
             )
             {
-                var color = matchingCommand.Response.EmbedColor ?? new Color(0);
+                Color color = new(0);
+                if (matchingCommand.Response.EmbedColor != null)
+                    color = new(
+                        matchingCommand.Response.EmbedColor.Value.R,
+                        matchingCommand.Response.EmbedColor.Value.G,
+                        matchingCommand.Response.EmbedColor.Value.B
+                    );
 
                 var embed = new EmbedProperties()
                     .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty)
@@ -185,8 +190,6 @@ public class DiscordPlatform : IBotPlatform
                 && !string.IsNullOrEmpty(matchingCommand.Response.EmbedFileName)
             )
             {
-                var color = matchingCommand.Response.EmbedColor ?? new Color(0);
-
                 await using var fileStream = File.OpenRead(matchingCommand.Response.EmbedFilePath);
                 var attachment = new AttachmentProperties(
                     matchingCommand.Response.EmbedFileName,
@@ -275,9 +278,17 @@ public class DiscordPlatform : IBotPlatform
                 || !string.IsNullOrEmpty(matchingCommand.Response.EmbedDescription)
             )
             {
+                Color color = new(0);
+                if (matchingCommand.Response.EmbedColor != null)
+                    color = new(
+                        matchingCommand.Response.EmbedColor.Value.R,
+                        matchingCommand.Response.EmbedColor.Value.G,
+                        matchingCommand.Response.EmbedColor.Value.B
+                    );
                 var embed = new EmbedProperties()
                     .WithTitle(matchingCommand.Response.EmbedTitle ?? string.Empty)
-                    .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty);
+                    .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty)
+                    .WithColor(color);
                 if (!string.IsNullOrEmpty(matchingCommand.Response.EmbedFileName))
                 {
                     embed.Image = new EmbedImageProperties(

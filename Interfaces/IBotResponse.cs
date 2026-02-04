@@ -1,12 +1,12 @@
+using System.Drawing;
 using LibMultibot.Platforms;
-using NetCord;
 
 namespace LibMultibot.Interfaces;
 
 public interface IBotResponse
 {
     public BotPlatforms ResponsePlatform { get; }
-    public string Message { get; }
+    public string? Message { get; }
     public string? EmbedFilePath { get; }
     public string? EmbedFileName { get; }
     public Color? EmbedColor { get; }
