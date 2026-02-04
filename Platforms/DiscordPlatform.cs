@@ -286,6 +286,7 @@ public class DiscordPlatform : IBotPlatform
                         matchingCommand.Response.EmbedColor.Value.G,
                         matchingCommand.Response.EmbedColor.Value.B
                     );
+
                 var embed = new EmbedProperties()
                     .WithTitle(matchingCommand.Response.EmbedTitle ?? string.Empty)
                     .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty)
