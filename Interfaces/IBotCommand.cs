@@ -20,4 +20,5 @@ public interface IBotCommand
     IBot OriginatingBot { get; }
     Task<bool> Init();
     bool IsActive { get; set; }
+    CancellationToken CancellationToken { get; set; }
 }

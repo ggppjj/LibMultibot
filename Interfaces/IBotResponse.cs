@@ -14,4 +14,5 @@ public interface IBotResponse
     public string? EmbedDescription { get; }
     public IBotCommand OriginatingCommand { get; }
     public Task<bool> PrepareResponse();
+    CancellationToken CancellationToken { get; set; }
 }

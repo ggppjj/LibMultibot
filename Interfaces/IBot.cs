@@ -8,4 +8,5 @@ public interface IBot
     Task<bool> Init();
     Task Shutdown();
     bool IsActive { get; set; }
+    CancellationToken CancellationToken { get; set; }
 }
