@@ -8,6 +8,7 @@ using NetCord.Gateway;
 using NetCord.Rest;
 using NetCord.Services.ApplicationCommands;
 using Serilog;
+using Serilog.Filters;
 
 namespace LibMultibot.Platforms;
 
@@ -160,9 +161,14 @@ public class DiscordPlatform : IBotPlatform
                 || !string.IsNullOrEmpty(matchingCommand.Response.EmbedDescription)
             )
             {
+                var color = matchingCommand.Response.EmbedColor ?? new Color(0);
+
                 var embed = new EmbedProperties()
-                    .WithTitle(matchingCommand.Response.EmbedTitle ?? string.Empty)
-                    .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty);
+                    .WithDescription(matchingCommand.Response.EmbedDescription ?? string.Empty)
+                    .WithColor(color);
+
+                if (matchingCommand.Response.EmbedTitle != null)
+                    embed = embed.WithTitle(matchingCommand.Response.EmbedTitle);
 
                 if (!string.IsNullOrEmpty(matchingCommand.Response.EmbedFileName))
                 {
@@ -179,6 +185,8 @@ public class DiscordPlatform : IBotPlatform
                 && !string.IsNullOrEmpty(matchingCommand.Response.EmbedFileName)
             )
             {
+                var color = matchingCommand.Response.EmbedColor ?? new Color(0);
+
                 await using var fileStream = File.OpenRead(matchingCommand.Response.EmbedFilePath);
                 var attachment = new AttachmentProperties(
                     matchingCommand.Response.EmbedFileName,

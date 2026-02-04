@@ -1,4 +1,5 @@
 using LibMultibot.Platforms;
+using NetCord;
 
 namespace LibMultibot.Interfaces;
 
@@ -8,6 +9,7 @@ public interface IBotResponse
     public string Message { get; }
     public string? EmbedFilePath { get; }
     public string? EmbedFileName { get; }
+    public Color? EmbedColor { get; }
     public string? EmbedTitle { get; }
     public string? EmbedDescription { get; }
     public IBotCommand OriginatingCommand { get; }
