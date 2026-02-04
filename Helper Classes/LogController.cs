@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Configuration;
+﻿using LibMultibot.Interfaces;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Primitives;
 using Serilog;
 using Serilog.Core;
@@ -27,12 +28,12 @@ public class LogController
                 Log.Logger = new LoggerConfiguration()
                     .MinimumLevel.ControlledBy(_levelSwitch)
                     .WriteTo.Console(
-                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}"
+                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {BotName: [{BotName}]} {SourceContext}: {Message:lj}{NewLine}{Exception}"
                     )
                     .WriteTo.File(
                         "logs/multibot-.log",
                         rollingInterval: RollingInterval.Day,
-                        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}"
+                        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {BotName: [{BotName}]} {SourceContext}: {Message:lj}{NewLine}{Exception}"
                     )
                     .CreateLogger();
 
@@ -77,5 +78,11 @@ public class LogController
         if (value != null)
             Log.Warning("Unknown log level '{Level}' in config, defaulting to Information", value);
         return LogEventLevel.Information;
+    }
+
+    public static class BotLogging
+    {
+        public static ILogger ForBotComponent<T>(IBot bot) =>
+            Log.Logger.ForContext<T>().ForContext("BotName", bot.Name);
     }
 }
