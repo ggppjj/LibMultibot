@@ -67,12 +67,12 @@ public class LogController
                 Log.Logger = new LoggerConfiguration()
                     .MinimumLevel.ControlledBy(_levelSwitch)
                     .WriteTo.Console(
-                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {BotName: [{BotName}]} {SourceContext}: {Message:lj}{NewLine}{Exception}"
+                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {BotName: BotName} {SourceContext}: {Message:lj}{NewLine}{Exception}"
                     )
                     .WriteTo.File(
                         "logs/multibot-.log",
                         rollingInterval: RollingInterval.Day,
-                        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {BotName: [{BotName}]} {SourceContext}: {Message:lj}{NewLine}{Exception}"
+                        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {BotName: BotName} {SourceContext}: {Message:lj}{NewLine}{Exception}"
                     )
                     .CreateLogger();
 
