@@ -10,6 +10,7 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.2" />
     <PackageReference Include="NetCord" Version="1.0.0-alpha.460" />
     <PackageReference Include="NetCord.Services" Version="1.0.0-alpha.460" />
+    <PackageReference Include="Serilog.Expressions" Version="5.1.0-dev-02309" />
     <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="8.0.0-dev-02318" />

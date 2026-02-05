@@ -4,6 +4,8 @@ using Microsoft.Extensions.Primitives;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
+using Serilog.Templates;
+using Serilog.Templates.Themes;
 
 namespace LibMultibot.Helper_Classes;
 
@@ -52,6 +54,11 @@ public class LogController
         "Still alive, still alive.",
     ];
 
+    private const string BloodRed = "\x1b[38;2;139;0;0m";
+    private const string CoolBlue = "\x1b[38;2;80;200;255m";
+
+    private const string Reset = "\x1b[0m";
+
     public static ILogger SetupLogging(
         Type contextType,
         IConfigurationRoot? localApplicationConfig = null
@@ -64,15 +71,37 @@ public class LogController
                 var logLevelFromConfig = localApplicationConfig?["LogLevel"];
                 var logLevel = ParseLogLevel(logLevelFromConfig);
                 _levelSwitch = new LoggingLevelSwitch(logLevel);
+
+                var consoleTemplate = new ExpressionTemplate(
+                    "[{@t:HH:mm:ss} "
+                        + "{#if SourceContext = 'HEARTBEAT'}"
+                        + BloodRed
+                        + "HRT"
+                        + Reset
+                        + "{#else}{@l:u3}{#end}]"
+                        + "{#if BotName is not null} {BotName} -{#end} "
+                        + "{#if SourceContext = 'HEARTBEAT'}"
+                        + CoolBlue
+                        + "{SourceContext}: {@m}"
+                        + Reset
+                        + "{#else}{SourceContext}: {@m}{#end}\n{@x}",
+                    theme: TemplateTheme.Code
+                );
+
+                var fileTemplate = new ExpressionTemplate(
+                    "[{@t:yyyy-MM-dd HH:mm:ss.fff zzz} "
+                        + "{#if SourceContext = 'HEARTBEAT'}HRT{#else}{@l:u3}{#end}]"
+                        + "{#if BotName is not null} {BotName} -{#end} "
+                        + "{SourceContext}: {@m}\n{@x}"
+                );
+
                 Log.Logger = new LoggerConfiguration()
                     .MinimumLevel.ControlledBy(_levelSwitch)
-                    .WriteTo.Console(
-                        outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {BotName: BotName} {SourceContext}: {Message:lj}{NewLine}{Exception}"
-                    )
+                    .WriteTo.Console(consoleTemplate)
                     .WriteTo.File(
+                        fileTemplate,
                         "logs/multibot-.log",
-                        rollingInterval: RollingInterval.Day,
-                        outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {BotName: BotName} {SourceContext}: {Message:lj}{NewLine}{Exception}"
+                        rollingInterval: RollingInterval.Day
                     )
                     .CreateLogger();
 
