@@ -1,4 +1,5 @@
 ﻿using LibMultibot.Platforms;
+using LibMultibot.Users;
 
 namespace LibMultibot.Interfaces;
 
@@ -21,4 +22,8 @@ public interface IBotCommand
     Task<bool> Init();
     bool IsActive { get; set; }
     CancellationToken CancellationToken { get; set; }
+    bool IsAdminCommand { get; }
+    List<User>? AdminUsers { get; set; }
+    List<ulong>? RestrictedToChannelIDs { get; set; }
+    string? MessageContext { get; set; }
 }

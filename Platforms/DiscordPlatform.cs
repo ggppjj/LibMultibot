@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using LibMultibot.Helper_Classes;
 using LibMultibot.Interfaces;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +33,7 @@ public class DiscordPlatform : IBotPlatform
     private readonly ILogger _logger;
     private readonly string? _token;
     public bool IsActive { get; set; } = true;
+    private readonly List<ulong> _trackedMessages = [];
 
     public event CommandEventHandler? OnCommand;
 
@@ -246,13 +248,44 @@ public class DiscordPlatform : IBotPlatform
         }
     }
 
+    public async Task SendMessage(string message, ulong? channelId, bool trackedMessage = false)
+    {
+        if (channelId == null)
+            return;
+        var sentMessage = await _client.Rest.SendMessageAsync(channelId.Value, message);
+        if (trackedMessage)
+            _trackedMessages.Add(sentMessage.Id);
+    }
+
     private async Task HandleMessageAsync(Message message)
     {
-        if (message.Author.IsBot || !message.Content.StartsWith('!') || !IsActive)
+        if (message.Author.IsBot || !IsActive)
             return;
 
         try
         {
+            var inReplyTo = message.MessageReference?.MessageId;
+            if (
+                inReplyTo != null
+                && message.GuildId != null
+                && _trackedMessages.Contains(inReplyTo.Value)
+            )
+            {
+                var guildUser = await _client.Rest.GetGuildUserAsync(
+                    message.GuildId.Value,
+                    message.Author.Id
+                );
+                await guildUser.TimeOutAsync(DateTime.Now.AddMinutes(5));
+                _logger.Warning(
+                    "Timed out {Username} ({UserId}) for replying to a tracked message.",
+                    message.Author.Username,
+                    message.Author.Id
+                );
+            }
+
+            if (!message.Content.StartsWith('!'))
+                return;
+
             var commandText = message.Content[1..].Split(' ')[0].ToLowerInvariant();
 
             var matchingCommand = Commands
@@ -264,6 +297,35 @@ public class DiscordPlatform : IBotPlatform
             if (matchingCommand is null)
                 return;
 
+            if (matchingCommand.RestrictedToChannelIDs?.Count > 0 && !matchingCommand.RestrictedToChannelIDs.Contains(message.ChannelId))
+            {
+                var author = message.Author;
+                var server = message.Guild?.Name;
+
+                await message.DeleteAsync();
+                var dm = await author.GetDMChannelAsync();
+                await dm.SendMessageAsync(
+                    @$"Whoops! 
+                    
+                    You tried to send a restricted command in the wrong channel in {(server ?? "some server that I couldn't figure out or something, let ggppjj know if you see this")}. 
+                    ""{message.Content}"". 
+                    You can only send that in channel ID(s) {String.Join(',', matchingCommand.RestrictedToChannelIDs?.Select(i => i.ToString()) ??
+                            [
+                                "Unknown!",
+                            ])}."
+                );
+                return;
+            }
+
+            if (
+                matchingCommand.IsAdminCommand
+                && (!matchingCommand.AdminUsers?.Any(i => i.Id == message.Author.Id) ?? false)
+            )
+            {
+                return;
+            }
+
+            matchingCommand.MessageContext = message.Content;
             var response = await matchingCommand.Response.PrepareResponse();
 
             if (!response)
@@ -273,6 +335,8 @@ public class DiscordPlatform : IBotPlatform
             }
 
             var messageProps = new ReplyMessageProperties();
+            if (!string.IsNullOrEmpty(matchingCommand.Response.Message))
+                messageProps.Content = matchingCommand.Response.Message;
 
             if (
                 !string.IsNullOrEmpty(matchingCommand.Response.EmbedTitle)
@@ -341,7 +405,7 @@ public class DiscordPlatform : IBotPlatform
             );
 
             var desiredCommands = new List<ApplicationCommandProperties>();
-            foreach (var command in Commands)
+            foreach (var command in Commands.Where(c => c.CommandType.HasFlag(BotCommandTypes.SlashCommand)))
             {
                 desiredCommands.Add(
                     new SlashCommandProperties(command.Name.ToLowerInvariant(), command.Description)

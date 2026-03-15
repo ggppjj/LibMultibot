@@ -6,5 +6,6 @@ public interface IBotPlatform
     IBot Bot { get; }
     List<IBotCommand> Commands { get; }
     Task Shutdown();
+    Task SendMessage(string message, ulong? channelId, bool trackedMessage = false);
     bool IsActive { get; set; }
 }
