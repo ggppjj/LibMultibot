@@ -19,11 +19,13 @@ public interface IBotCommand
     IBotResponse Response { get; }
     List<BotPlatforms> CommandPlatforms { get; }
     IBot OriginatingBot { get; }
-    Task<bool> Init();
+    Task<bool> Init() => Task.FromResult(true);
+    bool IsInitialized => true;
     bool IsActive { get; set; }
     CancellationToken CancellationToken { get; set; }
     bool IsAdminCommand { get; }
     List<User>? AdminUsers { get; set; }
     List<ulong>? RestrictedToChannelIDs { get; set; }
     string? MessageContext { get; set; }
+    ulong? MessageAuthorId { get; set; }
 }

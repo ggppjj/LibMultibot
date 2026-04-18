@@ -88,11 +88,9 @@ public class DiscordPlatform : IBotPlatform
         _client.Ready += async args => await OnClientReady(args);
 
         LoadCommands();
-        StartAsync().GetAwaiter().GetResult();
-        _logger.Information($"Started for {Bot.Name}.");
     }
 
-    internal async Task StartAsync()
+    public async Task StartAsync()
     {
         if (string.IsNullOrWhiteSpace(_token))
         {
@@ -100,6 +98,7 @@ public class DiscordPlatform : IBotPlatform
             throw new InvalidDataException("Missing bot token!");
         }
         await _client.StartAsync();
+        _logger.Information($"Started for {Bot.Name}.");
     }
 
     public async Task Shutdown()
@@ -132,6 +131,20 @@ public class DiscordPlatform : IBotPlatform
                         new InteractionMessageProperties
                         {
                             Content = "Unknown command.",
+                            Flags = MessageFlags.Ephemeral,
+                        }
+                    )
+                );
+                return;
+            }
+
+            if (!matchingCommand.IsInitialized)
+            {
+                await interaction.SendResponseAsync(
+                    InteractionCallback.Message(
+                        new InteractionMessageProperties
+                        {
+                            Content = "This command is not yet ready for use.",
                             Flags = MessageFlags.Ephemeral,
                         }
                     )
@@ -286,7 +299,9 @@ public class DiscordPlatform : IBotPlatform
             if (!message.Content.StartsWith('!'))
                 return;
 
-            var commandText = message.Content[1..].Split(' ')[0].ToLowerInvariant();
+            var commandText = new string(
+                message.Content[1..].Split(' ')[0].Where(c => !char.IsPunctuation(c)).ToArray()
+            ).ToLowerInvariant();
 
             var matchingCommand = Commands
                 .Where(c => c.CommandType.HasFlag(BotCommandTypes.TextCommand))
@@ -297,7 +312,16 @@ public class DiscordPlatform : IBotPlatform
             if (matchingCommand is null)
                 return;
 
-            if (matchingCommand.RestrictedToChannelIDs?.Count > 0 && !matchingCommand.RestrictedToChannelIDs.Contains(message.ChannelId))
+            if (!matchingCommand.IsInitialized)
+            {
+                await message.ReplyAsync("Command loading, please wait...");
+                return;
+            }
+
+            if (
+                matchingCommand.RestrictedToChannelIDs?.Count > 0
+                && !matchingCommand.RestrictedToChannelIDs.Contains(message.ChannelId)
+            )
             {
                 var author = message.Author;
                 var server = message.Guild?.Name;
@@ -326,6 +350,7 @@ public class DiscordPlatform : IBotPlatform
             }
 
             matchingCommand.MessageContext = message.Content;
+            matchingCommand.MessageAuthorId = message.Author.Id;
             var response = await matchingCommand.Response.PrepareResponse();
 
             if (!response)
@@ -405,7 +430,11 @@ public class DiscordPlatform : IBotPlatform
             );
 
             var desiredCommands = new List<ApplicationCommandProperties>();
-            foreach (var command in Commands.Where(c => c.CommandType.HasFlag(BotCommandTypes.SlashCommand)))
+            foreach (
+                var command in Commands.Where(c =>
+                    c.CommandType.HasFlag(BotCommandTypes.SlashCommand)
+                )
+            )
             {
                 desiredCommands.Add(
                     new SlashCommandProperties(command.Name.ToLowerInvariant(), command.Description)

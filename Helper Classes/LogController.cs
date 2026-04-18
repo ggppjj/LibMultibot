@@ -171,5 +171,8 @@ public class LogController
     {
         public static ILogger ForBotComponent<T>(IBot bot) =>
             Log.Logger.ForContext<T>().ForContext("BotName", bot.Name);
+
+        public static ILogger ForBotComponent(Type type, IBot bot) =>
+            Log.Logger.ForContext(type).ForContext("BotName", bot.Name);
     }
 }

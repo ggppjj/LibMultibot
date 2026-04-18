@@ -46,6 +46,8 @@ public abstract class CommandConfigBase<TConfig>
     private readonly string _configFilePath;
     private readonly ILogger _logger;
     private FileSystemWatcher? _configWatcher;
+    private CancellationTokenSource? _reloadCts;
+    private readonly object _reloadLock = new();
     public TConfig Config { get; private set; }
 
     protected abstract JsonSerializerContext JsonContext { get; }
@@ -98,6 +100,36 @@ public abstract class CommandConfigBase<TConfig>
         }
     }
 
+    private void ReloadConfiguration()
+    {
+        try
+        {
+            if (!File.Exists(_configFilePath))
+            {
+                _logger.Warning($"Config file not found at {_configFilePath}, keeping existing config.");
+                return;
+            }
+
+            var jsonContent = File.ReadAllText(_configFilePath);
+            var config = JsonSerializer.Deserialize(jsonContent, JsonTypeInfo);
+
+            if (config != null)
+            {
+                Config = config;
+                OnConfigLoaded();
+                _logger.Information($"Reloaded configuration from {_configFilePath}.");
+            }
+            else
+            {
+                _logger.Warning("Config file is empty or invalid after reload, keeping existing config.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Error reloading configuration, keeping existing config.");
+        }
+    }
+
     private void CreateAndSaveDefaultConfig()
     {
         try
@@ -132,12 +164,21 @@ public abstract class CommandConfigBase<TConfig>
 
             _configWatcher.Changed += (sender, e) =>
             {
-                Task.Delay(500)
-                    .ContinueWith(_ =>
-                    {
-                        _logger.Information("Config file changed, reloading...");
-                        LoadConfiguration();
-                    });
+                CancellationToken token;
+                lock (_reloadLock)
+                {
+                    _reloadCts?.Cancel();
+                    _reloadCts = new CancellationTokenSource();
+                    token = _reloadCts.Token;
+                }
+
+                Task.Delay(500, token).ContinueWith(t =>
+                {
+                    if (t.IsCanceled)
+                        return;
+                    _logger.Information("Config file changed, reloading...");
+                    ReloadConfiguration();
+                }, CancellationToken.None);
             };
 
             _logger.Information("Config file watcher enabled.");
