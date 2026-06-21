@@ -34,6 +34,7 @@ public class DiscordPlatform : IBotPlatform
     private readonly string? _token;
     public bool IsActive { get; set; } = true;
     private readonly List<ulong> _trackedMessages = [];
+    private readonly ModerationCommandConfig _moderationConfig;
 
     public event CommandEventHandler? OnCommand;
 
@@ -77,14 +78,21 @@ public class DiscordPlatform : IBotPlatform
                 Intents =
                     GatewayIntents.Guilds
                     | GatewayIntents.GuildMessages
-                    | GatewayIntents.MessageContent,
+                    | GatewayIntents.MessageContent
+                    | GatewayIntents.GuildMessageReactions,
             }
         );
+
+        _moderationConfig = new ModerationCommandConfig(Bot.Name, "Moderation", _logger);
 
         _commandService = new ApplicationCommandService<SlashCommandContext>();
 
         _client.InteractionCreate += async interaction => await HandleInteractionAsync(interaction);
         _client.MessageCreate += async message => await HandleMessageAsync(message);
+        _client.MessageReactionAdd += async args =>
+            await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: true);
+        _client.MessageReactionRemove += async args =>
+            await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: false);
         _client.Ready += async args => await OnClientReady(args);
 
         LoadCommands();
@@ -277,6 +285,28 @@ public class DiscordPlatform : IBotPlatform
 
         try
         {
+            if (
+                message.GuildId != null
+                && _moderationConfig.Config.HoneypotChannelIds.Contains(message.ChannelId)
+                && !_moderationConfig.Config.HoneypotExemptUserIds.Contains(message.Author.Id)
+            )
+            {
+                await _client.Rest.BanGuildUserAsync(
+                    message.GuildId.Value,
+                    message.Author.Id,
+                    _moderationConfig.Config.HoneypotBanDeleteMessageSeconds,
+                    new RestRequestProperties { AuditLogReason = "Auto-ban: posted in honeypot channel." }
+                );
+                _logger.Warning(
+                    "Banned {Username} ({UserId}) for posting in honeypot channel {ChannelId}; purged last {Seconds}s of messages.",
+                    message.Author.Username,
+                    message.Author.Id,
+                    message.ChannelId,
+                    _moderationConfig.Config.HoneypotBanDeleteMessageSeconds
+                );
+                return;
+            }
+
             var inReplyTo = message.MessageReference?.MessageId;
             if (
                 inReplyTo != null
@@ -418,6 +448,65 @@ public class DiscordPlatform : IBotPlatform
             {
                 _logger.Error(replyEx, "Failed to send error response.");
             }
+        }
+    }
+
+    private async Task HandleReactionAsync(
+        ulong? guildId,
+        ulong messageId,
+        ulong userId,
+        string? emojiName,
+        bool hide
+    )
+    {
+        if (guildId == null || !IsActive)
+            return;
+
+        var toggle = _moderationConfig.Config.ReactionChannelToggles.FirstOrDefault(t =>
+            t.MessageId == messageId
+            && string.Equals(t.Emoji, emojiName, StringComparison.Ordinal)
+        );
+
+        if (toggle == null)
+            return;
+
+        try
+        {
+            if (hide)
+            {
+                // Add a per-user overwrite denying ViewChannel -> channel disappears for them.
+                await _client.Rest.ModifyGuildChannelPermissionsAsync(
+                    toggle.TargetChannelId,
+                    new PermissionOverwriteProperties(userId, PermissionOverwriteType.User)
+                    {
+                        Denied = Permissions.ViewChannel,
+                    }
+                );
+                _logger.Information(
+                    "Hid channel {ChannelId} for user {UserId} via reaction toggle.",
+                    toggle.TargetChannelId,
+                    userId
+                );
+            }
+            else
+            {
+                // Reaction removed -> drop the overwrite, restoring default visibility.
+                await _client.Rest.DeleteGuildChannelPermissionAsync(toggle.TargetChannelId, userId);
+                _logger.Information(
+                    "Restored channel {ChannelId} visibility for user {UserId} (reaction removed).",
+                    toggle.TargetChannelId,
+                    userId
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                ex,
+                "Failed to toggle channel {ChannelId} visibility for user {UserId}.",
+                toggle.TargetChannelId,
+                userId
+            );
         }
     }
 
