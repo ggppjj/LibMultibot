@@ -17,6 +17,12 @@ public class ReactionChannelToggle
     public ulong MessageId { get; set; }
 
     /// <summary>
+    /// The channel that holds <see cref="MessageId"/>. Required so the bot can
+    /// fetch reactions on startup and process any added/removed while it was down.
+    /// </summary>
+    public ulong MessageChannelId { get; set; }
+
+    /// <summary>
     /// Unicode emoji (e.g. "🙈") or the name of a custom guild emoji (without
     /// colons). Matched against the reaction's emoji name.
     /// </summary>
@@ -67,7 +73,8 @@ internal class ModerationCommandConfig(string botName, string commandName, ILogg
             [
                 new ReactionChannelToggle
                 {
-                    MessageId = 1518310530744324156, // explainer message (in 898653215371968532)
+                    MessageId = 1518310530744324156, // explainer message
+                    MessageChannelId = 898653215371968532, // channel holding the explainer
                     Emoji = "👍",
                     TargetChannelId = 1518310706049454211, // hide honeypot
                 },

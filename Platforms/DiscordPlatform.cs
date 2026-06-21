@@ -288,9 +288,19 @@ public class DiscordPlatform : IBotPlatform
             if (
                 message.GuildId != null
                 && _moderationConfig.Config.HoneypotChannelIds.Contains(message.ChannelId)
-                && !_moderationConfig.Config.HoneypotExemptUserIds.Contains(message.Author.Id)
             )
             {
+                if (_moderationConfig.Config.HoneypotExemptUserIds.Contains(message.Author.Id))
+                {
+                    _logger.Warning(
+                        "Honeypot ACTIVE: exempt user {Username} ({UserId}) posted in honeypot channel {ChannelId} — skipping ban (whitelisted).",
+                        message.Author.Username,
+                        message.Author.Id,
+                        message.ChannelId
+                    );
+                    return;
+                }
+
                 await _client.Rest.BanGuildUserAsync(
                     message.GuildId.Value,
                     message.Author.Id,
@@ -470,43 +480,138 @@ public class DiscordPlatform : IBotPlatform
         if (toggle == null)
             return;
 
+        if (hide)
+            await HideChannelForUserAsync(toggle.TargetChannelId, userId);
+        else
+            await RestoreChannelForUserAsync(toggle.TargetChannelId, userId);
+    }
+
+    // Add a per-user overwrite denying ViewChannel -> channel disappears for them.
+    private async Task HideChannelForUserAsync(ulong channelId, ulong userId)
+    {
         try
         {
-            if (hide)
-            {
-                // Add a per-user overwrite denying ViewChannel -> channel disappears for them.
-                await _client.Rest.ModifyGuildChannelPermissionsAsync(
-                    toggle.TargetChannelId,
-                    new PermissionOverwriteProperties(userId, PermissionOverwriteType.User)
-                    {
-                        Denied = Permissions.ViewChannel,
-                    }
-                );
-                _logger.Information(
-                    "Hid channel {ChannelId} for user {UserId} via reaction toggle.",
-                    toggle.TargetChannelId,
-                    userId
-                );
-            }
-            else
-            {
-                // Reaction removed -> drop the overwrite, restoring default visibility.
-                await _client.Rest.DeleteGuildChannelPermissionAsync(toggle.TargetChannelId, userId);
-                _logger.Information(
-                    "Restored channel {ChannelId} visibility for user {UserId} (reaction removed).",
-                    toggle.TargetChannelId,
-                    userId
-                );
-            }
+            await _client.Rest.ModifyGuildChannelPermissionsAsync(
+                channelId,
+                new PermissionOverwriteProperties(userId, PermissionOverwriteType.User)
+                {
+                    Denied = Permissions.ViewChannel,
+                }
+            );
+            _logger.Information("Hid channel {ChannelId} for user {UserId}.", channelId, userId);
         }
         catch (Exception ex)
         {
             _logger.Error(
                 ex,
-                "Failed to toggle channel {ChannelId} visibility for user {UserId}.",
-                toggle.TargetChannelId,
+                "Failed to hide channel {ChannelId} for user {UserId}.",
+                channelId,
                 userId
             );
+        }
+    }
+
+    // Drop the per-user overwrite, restoring default visibility.
+    private async Task RestoreChannelForUserAsync(ulong channelId, ulong userId)
+    {
+        try
+        {
+            await _client.Rest.DeleteGuildChannelPermissionAsync(channelId, userId);
+            _logger.Information(
+                "Restored channel {ChannelId} visibility for user {UserId}.",
+                channelId,
+                userId
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                ex,
+                "Failed to restore channel {ChannelId} for user {UserId}.",
+                channelId,
+                userId
+            );
+        }
+    }
+
+    // Reactions added/removed while the bot was offline never arrive as gateway
+    // events. On startup, fetch each toggle message's current reactors and bring
+    // the target channel's per-user overwrites in line with them: hide for anyone
+    // currently reacting, restore anyone who is no longer reacting.
+    private async Task ReconcileReactionTogglesAsync()
+    {
+        foreach (var toggle in _moderationConfig.Config.ReactionChannelToggles)
+        {
+            if (
+                toggle.MessageId == 0
+                || toggle.MessageChannelId == 0
+                || toggle.TargetChannelId == 0
+                || string.IsNullOrEmpty(toggle.Emoji)
+            )
+                continue;
+
+            try
+            {
+                // Custom emoji need an ID we don't store; only unicode is reconcilable.
+                var emoji = new ReactionEmojiProperties(toggle.Emoji);
+
+                var reacted = new HashSet<ulong>();
+                await foreach (
+                    var user in _client.Rest.GetMessageReactionsAsync(
+                        toggle.MessageChannelId,
+                        toggle.MessageId,
+                        emoji
+                    )
+                )
+                {
+                    if (!user.IsBot)
+                        reacted.Add(user.Id);
+                }
+
+                // Existing per-user "hide" overwrites we previously wrote (deny == ViewChannel only).
+                var hiddenNow = new HashSet<ulong>();
+                if (
+                    await _client.Rest.GetChannelAsync(toggle.TargetChannelId)
+                    is IGuildChannel guildChannel
+                )
+                {
+                    foreach (var (id, overwrite) in guildChannel.PermissionOverwrites)
+                    {
+                        if (
+                            overwrite.Type == PermissionOverwriteType.User
+                            && overwrite.Denied == Permissions.ViewChannel
+                            && overwrite.Allowed == default
+                        )
+                            hiddenNow.Add(id);
+                    }
+                }
+
+                foreach (var userId in reacted.Where(u => !hiddenNow.Contains(u)))
+                {
+                    _logger.Information(
+                        "Backlog: applying hide for user {UserId} who reacted while offline.",
+                        userId
+                    );
+                    await HideChannelForUserAsync(toggle.TargetChannelId, userId);
+                }
+
+                foreach (var userId in hiddenNow.Where(u => !reacted.Contains(u)))
+                {
+                    _logger.Information(
+                        "Backlog: restoring user {UserId} who removed their reaction while offline.",
+                        userId
+                    );
+                    await RestoreChannelForUserAsync(toggle.TargetChannelId, userId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(
+                    ex,
+                    "Failed to reconcile reaction toggle on message {MessageId}.",
+                    toggle.MessageId
+                );
+            }
         }
     }
 
@@ -545,6 +650,8 @@ public class DiscordPlatform : IBotPlatform
             {
                 _logger.Information("Commands are up to date, skipping registration.");
             }
+
+            await ReconcileReactionTogglesAsync();
 
             _logger.Information("Ready!");
         }
