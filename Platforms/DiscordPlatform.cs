@@ -35,6 +35,8 @@ public class DiscordPlatform : IBotPlatform
     public bool IsActive { get; set; } = true;
     private readonly List<ulong> _trackedMessages = [];
     private readonly ModerationCommandConfig _moderationConfig;
+    private readonly BanRestoreStore _banRestoreStore;
+    private volatile bool _isReady;
 
     public event CommandEventHandler? OnCommand;
 
@@ -79,11 +81,21 @@ public class DiscordPlatform : IBotPlatform
                     GatewayIntents.Guilds
                     | GatewayIntents.GuildMessages
                     | GatewayIntents.MessageContent
-                    | GatewayIntents.GuildMessageReactions,
+                    | GatewayIntents.GuildMessageReactions
+                    | GatewayIntents.GuildUsers,
             }
         );
 
         _moderationConfig = new ModerationCommandConfig(Bot.Name, "Moderation", _logger);
+        _banRestoreStore = new BanRestoreStore(Bot.Name, _logger);
+        // Runtime config edits (e.g. re-pointing an opt-out message/channel) should
+        // re-scan reactions, just like startup. Live ban/reaction matching already
+        // reads the latest config per event, so only the reconcile needs nudging.
+        _moderationConfig.Reloaded += () =>
+        {
+            if (_isReady)
+                _ = ReconcileReactionTogglesAsync();
+        };
 
         _commandService = new ApplicationCommandService<SlashCommandContext>();
 
@@ -93,6 +105,13 @@ public class DiscordPlatform : IBotPlatform
             await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: true);
         _client.MessageReactionRemove += async args =>
             await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: false);
+        // Mod bulk removals (clear all reactions / clear one emoji) don't fire
+        // per-user remove events; reconcile the affected message instead.
+        _client.MessageReactionRemoveAll += async args =>
+            await ReconcileByOptOutMessageAsync(args.MessageId);
+        _client.MessageReactionRemoveEmoji += async args =>
+            await ReconcileByOptOutMessageAsync(args.MessageId);
+        _client.GuildUserAdd += async member => await HandleGuildUserAddAsync(member);
         _client.Ready += async args => await OnClientReady(args);
 
         LoadCommands();
@@ -285,12 +304,12 @@ public class DiscordPlatform : IBotPlatform
 
         try
         {
-            if (
-                message.GuildId != null
-                && _moderationConfig.Config.HoneypotChannelIds.Contains(message.ChannelId)
-            )
+            var honeypot = _moderationConfig.Config.Honeypots.FirstOrDefault(h =>
+                h.ChannelId == message.ChannelId
+            );
+            if (message.GuildId != null && honeypot != null)
             {
-                if (_moderationConfig.Config.HoneypotExemptUserIds.Contains(message.Author.Id))
+                if (honeypot.ExemptUserIds.Contains(message.Author.Id))
                 {
                     _logger.Warning(
                         "Honeypot ACTIVE: exempt user {Username} ({UserId}) posted in honeypot channel {ChannelId} — skipping ban (whitelisted).",
@@ -301,10 +320,41 @@ public class DiscordPlatform : IBotPlatform
                     return;
                 }
 
+                // Snapshot roles + nick before banning so they can be reapplied if
+                // the user is later unbanned and rejoins.
+                try
+                {
+                    var member = await _client.Rest.GetGuildUserAsync(
+                        message.GuildId.Value,
+                        message.Author.Id
+                    );
+                    _banRestoreStore.Add(
+                        new BanRestoreRecord
+                        {
+                            GuildId = message.GuildId.Value,
+                            UserId = message.Author.Id,
+                            // RoleIds excludes @everyone (its id == the guild id).
+                            RoleIds = member
+                                .RoleIds.Where(id => id != message.GuildId.Value)
+                                .ToList(),
+                            Nickname = member.Nickname,
+                            BannedAt = DateTimeOffset.UtcNow,
+                        }
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning(
+                        ex,
+                        "Couldn't snapshot roles/nick before banning {UserId}; restore unavailable.",
+                        message.Author.Id
+                    );
+                }
+
                 await _client.Rest.BanGuildUserAsync(
                     message.GuildId.Value,
                     message.Author.Id,
-                    _moderationConfig.Config.HoneypotBanDeleteMessageSeconds,
+                    honeypot.BanDeleteMessageSeconds,
                     new RestRequestProperties { AuditLogReason = "Auto-ban: posted in honeypot channel." }
                 );
                 _logger.Warning(
@@ -312,7 +362,7 @@ public class DiscordPlatform : IBotPlatform
                     message.Author.Username,
                     message.Author.Id,
                     message.ChannelId,
-                    _moderationConfig.Config.HoneypotBanDeleteMessageSeconds
+                    honeypot.BanDeleteMessageSeconds
                 );
                 return;
             }
@@ -472,18 +522,154 @@ public class DiscordPlatform : IBotPlatform
         if (guildId == null || !IsActive)
             return;
 
-        var toggle = _moderationConfig.Config.ReactionChannelToggles.FirstOrDefault(t =>
-            t.MessageId == messageId
-            && string.Equals(t.Emoji, emojiName, StringComparison.Ordinal)
+        var honeypot = _moderationConfig.Config.Honeypots.FirstOrDefault(h =>
+            h.HasOptOut && h.OptOutMessageId == messageId && OptOutEmojiMatches(h, emojiName)
         );
 
-        if (toggle == null)
+        if (honeypot == null)
             return;
 
         if (hide)
-            await HideChannelForUserAsync(toggle.TargetChannelId, userId);
-        else
-            await RestoreChannelForUserAsync(toggle.TargetChannelId, userId);
+        {
+            await HideChannelForUserAsync(honeypot.ChannelId, userId);
+            return;
+        }
+
+        // Reaction removed. Under "*", a user may have stacked several reactions;
+        // only unhide once their LAST opt-out reaction is gone. Otherwise removing
+        // any one would let them peek while still "opted out".
+        if (honeypot.OptOutEmoji == AnyEmojiWildcard && await UserHasOptOutReactionAsync(honeypot, userId))
+            return;
+
+        await RestoreChannelForUserAsync(honeypot.ChannelId, userId);
+    }
+
+    // A previously-banned user rejoined (after being unbanned). If we snapshotted
+    // their roles/nick at ban time, reapply them now.
+    private async Task HandleGuildUserAddAsync(GuildUser member)
+    {
+        if (!IsActive)
+            return;
+
+        var record = _banRestoreStore.TryTake(member.GuildId, member.Id);
+        if (record == null)
+            return;
+
+        // Add roles one at a time so a single un-addable role (managed, or above the
+        // bot's highest role) doesn't block the rest.
+        var restored = 0;
+        foreach (var roleId in record.RoleIds)
+        {
+            try
+            {
+                await _client.Rest.AddGuildUserRoleAsync(member.GuildId, member.Id, roleId);
+                restored++;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(
+                    ex,
+                    "Couldn't reapply role {RoleId} to returning user {UserId}.",
+                    roleId,
+                    member.Id
+                );
+            }
+        }
+
+        if (!string.IsNullOrEmpty(record.Nickname))
+        {
+            try
+            {
+                await _client.Rest.ModifyGuildUserAsync(
+                    member.GuildId,
+                    member.Id,
+                    o => o.Nickname = record.Nickname
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(
+                    ex,
+                    "Couldn't restore nickname for returning user {UserId}.",
+                    member.Id
+                );
+            }
+        }
+
+        _logger.Information(
+            "Restored {Restored}/{Total} role(s){Nick} for returning user {Username} ({UserId}).",
+            restored,
+            record.RoleIds.Count,
+            string.IsNullOrEmpty(record.Nickname) ? "" : " and nickname",
+            member.Username,
+            member.Id
+        );
+    }
+
+    // "*" wildcard => any emoji opts out; otherwise an exact emoji-name match.
+    private const string AnyEmojiWildcard = "*";
+
+    private static bool OptOutEmojiMatches(Honeypot honeypot, string? reactionEmojiName) =>
+        honeypot.OptOutEmoji == AnyEmojiWildcard
+        || string.Equals(honeypot.OptOutEmoji, reactionEmojiName, StringComparison.Ordinal);
+
+    // Does the user still have any qualifying opt-out reaction on the message?
+    // Used on remove to avoid unhiding while another reaction remains.
+    private async Task<bool> UserHasOptOutReactionAsync(Honeypot honeypot, ulong userId)
+    {
+        try
+        {
+            foreach (var emoji in await GetOptOutEmojisAsync(honeypot))
+            {
+                await foreach (
+                    var user in _client.Rest.GetMessageReactionsAsync(
+                        honeypot.OptOutMessageChannelId,
+                        honeypot.OptOutMessageId,
+                        emoji
+                    )
+                )
+                {
+                    if (user.Id == userId)
+                        return true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // On error, assume a reaction may remain so we don't wrongly unhide.
+            _logger.Error(
+                ex,
+                "Failed to check remaining reactions for user {UserId} on message {MessageId}; keeping hidden.",
+                userId,
+                honeypot.OptOutMessageId
+            );
+            return true;
+        }
+        return false;
+    }
+
+    // The emoji that count as opt-out for this honeypot. For "*", every emoji
+    // currently on the message (custom emoji included via their IDs); otherwise
+    // the single configured unicode emoji.
+    private async Task<List<ReactionEmojiProperties>> GetOptOutEmojisAsync(Honeypot honeypot)
+    {
+        if (honeypot.OptOutEmoji != AnyEmojiWildcard)
+            return [new ReactionEmojiProperties(honeypot.OptOutEmoji)];
+
+        var message = await _client.Rest.GetMessageAsync(
+            honeypot.OptOutMessageChannelId,
+            honeypot.OptOutMessageId
+        );
+        return
+        [
+            .. message
+                .Reactions.Where(r => r.Emoji.Name is not null)
+                .Select(r =>
+                    r.Emoji.Id is { } id
+                        ? new ReactionEmojiProperties(r.Emoji.Name!, id)
+                        : new ReactionEmojiProperties(r.Emoji.Name!)
+                ),
+        ];
     }
 
     // Add a per-user overwrite denying ViewChannel -> channel disappears for them.
@@ -540,26 +726,28 @@ public class DiscordPlatform : IBotPlatform
     // currently reacting, restore anyone who is no longer reacting.
     private async Task ReconcileReactionTogglesAsync()
     {
-        foreach (var toggle in _moderationConfig.Config.ReactionChannelToggles)
+        foreach (var honeypot in _moderationConfig.Config.Honeypots)
+            await ReconcileHoneypotAsync(honeypot);
+    }
+
+    // Bring a honeypot channel's per-user "hide" overwrites in line with who
+    // currently reacts to its opt-out message: hide everyone reacting, restore
+    // everyone no longer reacting. Self-correcting, so it handles startup backlog
+    // and bulk mod reaction removals (remove-all / remove-emoji) alike.
+    private async Task ReconcileHoneypotAsync(Honeypot honeypot)
+    {
+        if (!honeypot.HasOptOut || honeypot.ChannelId == 0)
+            return;
+
+        try
         {
-            if (
-                toggle.MessageId == 0
-                || toggle.MessageChannelId == 0
-                || toggle.TargetChannelId == 0
-                || string.IsNullOrEmpty(toggle.Emoji)
-            )
-                continue;
-
-            try
+            var reacted = new HashSet<ulong>();
+            foreach (var emoji in await GetOptOutEmojisAsync(honeypot))
             {
-                // Custom emoji need an ID we don't store; only unicode is reconcilable.
-                var emoji = new ReactionEmojiProperties(toggle.Emoji);
-
-                var reacted = new HashSet<ulong>();
                 await foreach (
                     var user in _client.Rest.GetMessageReactionsAsync(
-                        toggle.MessageChannelId,
-                        toggle.MessageId,
+                        honeypot.OptOutMessageChannelId,
+                        honeypot.OptOutMessageId,
                         emoji
                     )
                 )
@@ -567,52 +755,66 @@ public class DiscordPlatform : IBotPlatform
                     if (!user.IsBot)
                         reacted.Add(user.Id);
                 }
+            }
 
-                // Existing per-user "hide" overwrites we previously wrote (deny == ViewChannel only).
-                var hiddenNow = new HashSet<ulong>();
-                if (
-                    await _client.Rest.GetChannelAsync(toggle.TargetChannelId)
-                    is IGuildChannel guildChannel
-                )
+            // Existing per-user "hide" overwrites we previously wrote (deny == ViewChannel only).
+            var hiddenNow = new HashSet<ulong>();
+            if (
+                await _client.Rest.GetChannelAsync(honeypot.ChannelId) is IGuildChannel guildChannel
+            )
+            {
+                foreach (var (id, overwrite) in guildChannel.PermissionOverwrites)
                 {
-                    foreach (var (id, overwrite) in guildChannel.PermissionOverwrites)
-                    {
-                        if (
-                            overwrite.Type == PermissionOverwriteType.User
-                            && overwrite.Denied == Permissions.ViewChannel
-                            && overwrite.Allowed == default
-                        )
-                            hiddenNow.Add(id);
-                    }
-                }
-
-                foreach (var userId in reacted.Where(u => !hiddenNow.Contains(u)))
-                {
-                    _logger.Information(
-                        "Backlog: applying hide for user {UserId} who reacted while offline.",
-                        userId
-                    );
-                    await HideChannelForUserAsync(toggle.TargetChannelId, userId);
-                }
-
-                foreach (var userId in hiddenNow.Where(u => !reacted.Contains(u)))
-                {
-                    _logger.Information(
-                        "Backlog: restoring user {UserId} who removed their reaction while offline.",
-                        userId
-                    );
-                    await RestoreChannelForUserAsync(toggle.TargetChannelId, userId);
+                    if (
+                        overwrite.Type == PermissionOverwriteType.User
+                        && overwrite.Denied == Permissions.ViewChannel
+                        && overwrite.Allowed == default
+                    )
+                        hiddenNow.Add(id);
                 }
             }
-            catch (Exception ex)
+
+            foreach (var userId in reacted.Where(u => !hiddenNow.Contains(u)))
             {
-                _logger.Error(
-                    ex,
-                    "Failed to reconcile reaction toggle on message {MessageId}.",
-                    toggle.MessageId
+                _logger.Information(
+                    "Reconcile: applying hide for reacting user {UserId}.",
+                    userId
                 );
+                await HideChannelForUserAsync(honeypot.ChannelId, userId);
+            }
+
+            foreach (var userId in hiddenNow.Where(u => !reacted.Contains(u)))
+            {
+                _logger.Information(
+                    "Reconcile: restoring user {UserId} who no longer reacts.",
+                    userId
+                );
+                await RestoreChannelForUserAsync(honeypot.ChannelId, userId);
             }
         }
+        catch (Exception ex)
+        {
+            _logger.Error(
+                ex,
+                "Failed to reconcile honeypot opt-out on message {MessageId}.",
+                honeypot.OptOutMessageId
+            );
+        }
+    }
+
+    // Bulk reaction removals by a mod (clear-all or clear-one-emoji) don't fire
+    // per-user remove events, so reconcile every honeypot tied to that message.
+    private async Task ReconcileByOptOutMessageAsync(ulong messageId)
+    {
+        if (!_isReady)
+            return;
+
+        foreach (
+            var honeypot in _moderationConfig.Config.Honeypots.Where(h =>
+                h.HasOptOut && h.OptOutMessageId == messageId
+            )
+        )
+            await ReconcileHoneypotAsync(honeypot);
     }
 
     private async Task OnClientReady(ReadyEventArgs args)
@@ -651,6 +853,7 @@ public class DiscordPlatform : IBotPlatform
                 _logger.Information("Commands are up to date, skipping registration.");
             }
 
+            _isReady = true;
             await ReconcileReactionTogglesAsync();
 
             _logger.Information("Ready!");
