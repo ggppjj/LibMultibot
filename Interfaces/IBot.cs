@@ -10,6 +10,14 @@ public interface IBot
     Task Shutdown();
     Task RequestShutdown();
     Task SendMessage(string message, ulong channelId, bool trackedMessage = false);
+    Task SendEmbed(
+        ulong channelId,
+        string? title,
+        string? description,
+        System.Drawing.Color? color = null,
+        string? filePath = null,
+        string? fileName = null
+    );
     bool IsActive { get; set; }
     CancellationToken CancellationToken { get; set; }
 }

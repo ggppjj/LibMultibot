@@ -8,7 +8,8 @@ public interface IBotScheduledMessage
     int FrequencyMinutes { get; set; }
     bool IsEnabled { get; set; }
     event Action<object> OnReply;
-    List<ulong> ChannelIds { get; }
+    bool AddChannel(ulong channelId);
+    bool RemoveChannel(ulong channelId);
     IBotCommand ManagementCommand { get; }
     void Start();
     void Stop();

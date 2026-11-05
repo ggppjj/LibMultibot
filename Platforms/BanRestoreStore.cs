@@ -75,7 +75,10 @@ internal class BanRestoreStore
         try
         {
             var json = JsonSerializer.Serialize(_data, BanRestoreJsonContext.Default.BanRestoreData);
-            File.WriteAllText(_path, json);
+            // Through a temp file, so a crash mid-write can't corrupt the store.
+            var tempPath = _path + ".tmp";
+            File.WriteAllText(tempPath, json);
+            File.Move(tempPath, _path, overwrite: true);
         }
         catch (Exception ex)
         {

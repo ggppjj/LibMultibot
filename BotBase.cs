@@ -18,6 +18,12 @@ public abstract class BotBase : IBot
 
     private const int CommandInactivityTimeoutMs = 30_000;
     private const int HeartbeatLogIntervalMs = 10_000;
+    private const int HeartbeatMinIntervalMs = 1_000;
+
+    private sealed class InlineProgress(Action<string> report) : IProgress<string>
+    {
+        public void Report(string value) => report(value);
+    }
 
     protected BotBase(CancellationTokenSource shutdownSource)
     {
@@ -76,15 +82,23 @@ public abstract class BotBase : IBot
         {
             if (!originalToken.IsCancellationRequested)
                 _logger.Warning(
-                    $"'{cmd.Name}' init watchdog fired — no heartbeat within {CommandInactivityTimeoutMs / 1000}s."
+                    $"'{cmd.Name}' init watchdog fired: no heartbeat within {CommandInactivityTimeoutMs / 1000}s."
                 );
         });
 
         if (cmd is IHeartbeatInit heartbeatCmd)
         {
-            var lastLogMs = long.MinValue;
-            heartbeatCmd.InitProgress = new Progress<string>(msg =>
+            var lastLogMs = 0L;
+            var lastHeartbeatTick = Environment.TickCount64;
+            // Not Progress<T>: it queues every report on the thread pool, and a command can
+            // report millions of times during init, which delays everything else in the bot.
+            heartbeatCmd.InitProgress = new InlineProgress(msg =>
             {
+                var tick = Environment.TickCount64;
+                if (tick - Volatile.Read(ref lastHeartbeatTick) < HeartbeatMinIntervalMs)
+                    return;
+                Volatile.Write(ref lastHeartbeatTick, tick);
+
                 var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 var prev = Interlocked.Read(ref lastLogMs);
                 if (
@@ -131,6 +145,24 @@ public abstract class BotBase : IBot
     {
         foreach (var platform in _platforms)
             await platform.SendMessage(message, channelId, trackedMessage);
+    }
+
+    public virtual async Task SendEmbed(
+        ulong channelId,
+        string? title,
+        string? description,
+        System.Drawing.Color? color = null,
+        string? filePath = null,
+        string? fileName = null
+    )
+    {
+        // Platforms join this list once started. Fail rather than silently send nowhere, so
+        // a caller doesn't count a post made during startup as delivered.
+        if (_platforms.Count == 0)
+            throw new InvalidOperationException("No platforms are running.");
+
+        foreach (var platform in _platforms)
+            await platform.SendEmbed(channelId, title, description, color, filePath, fileName);
     }
 
     public Task RequestShutdown()

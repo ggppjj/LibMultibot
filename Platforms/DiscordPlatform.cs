@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -33,9 +34,14 @@ public class DiscordPlatform : IBotPlatform
     private readonly ILogger _logger;
     private readonly string? _token;
     public bool IsActive { get; set; } = true;
-    private readonly List<ulong> _trackedMessages = [];
+    private readonly ConcurrentDictionary<ulong, byte> _trackedMessages = new();
+
+    // Gateway events are handled concurrently, but a command keeps its request and response
+    // in its own properties, so each command handles one request at a time.
+    private readonly ConcurrentDictionary<IBotCommand, SemaphoreSlim> _commandLocks = new();
     private readonly ModerationCommandConfig _moderationConfig;
     private readonly BanRestoreStore _banRestoreStore;
+    private readonly HideSkipStore _hideSkipStore;
     private volatile bool _isReady;
 
     public event CommandEventHandler? OnCommand;
@@ -88,6 +94,7 @@ public class DiscordPlatform : IBotPlatform
 
         _moderationConfig = new ModerationCommandConfig(Bot.Name, "Moderation", _logger);
         _banRestoreStore = new BanRestoreStore(Bot.Name, _logger);
+        _hideSkipStore = new HideSkipStore(Bot.Name, _logger);
         // Runtime config edits (e.g. re-pointing an opt-out message/channel) should
         // re-scan reactions, just like startup. Live ban/reaction matching already
         // reads the latest config per event, so only the reconcile needs nudging.
@@ -102,7 +109,12 @@ public class DiscordPlatform : IBotPlatform
         _client.InteractionCreate += async interaction => await HandleInteractionAsync(interaction);
         _client.MessageCreate += async message => await HandleMessageAsync(message);
         _client.MessageReactionAdd += async args =>
+        {
+            // Reconciling ignores bots, and would undo a hide applied to one here.
+            if (args.User?.IsBot == true)
+                return;
             await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: true);
+        };
         _client.MessageReactionRemove += async args =>
             await HandleReactionAsync(args.GuildId, args.MessageId, args.UserId, args.Emoji.Name, hide: false);
         // Mod bulk removals (clear all reactions / clear one emoji) don't fire
@@ -133,6 +145,21 @@ public class DiscordPlatform : IBotPlatform
         _logger.Information($"Shutting down for {Bot.Name}...");
         await _client.CloseAsync();
         _logger.Information($"Shutdown for {Bot.Name} complete.");
+    }
+
+    private static bool IsAdmin(IBotCommand command, ulong userId) =>
+        command.AdminUsers?.Any(u => u.Id == userId) == true;
+
+    private async Task<CommandLockHold> HoldCommandAsync(IBotCommand command)
+    {
+        var commandLock = _commandLocks.GetOrAdd(command, _ => new SemaphoreSlim(1, 1));
+        await commandLock.WaitAsync();
+        return new CommandLockHold(commandLock);
+    }
+
+    private sealed class CommandLockHold(SemaphoreSlim commandLock) : IDisposable
+    {
+        public void Dispose() => commandLock.Release();
     }
 
     private async Task HandleInteractionAsync(Interaction interaction)
@@ -179,8 +206,35 @@ public class DiscordPlatform : IBotPlatform
                 return;
             }
 
+            var notAllowed =
+                matchingCommand.IsAdminCommand && !IsAdmin(matchingCommand, interaction.User.Id);
+            var wrongChannel =
+                matchingCommand.RestrictedToChannelIDs?.Count > 0
+                && !matchingCommand.RestrictedToChannelIDs.Contains(interaction.Channel.Id);
+            if (notAllowed || wrongChannel)
+            {
+                await interaction.SendResponseAsync(
+                    InteractionCallback.Message(
+                        new InteractionMessageProperties
+                        {
+                            Content = notAllowed
+                                ? "You can't use this command."
+                                : "This command can't be used in this channel.",
+                            Flags = MessageFlags.Ephemeral,
+                        }
+                    )
+                );
+                return;
+            }
+
             await interaction.SendResponseAsync(InteractionCallback.DeferredMessage());
 
+            using var commandHold = await HoldCommandAsync(matchingCommand);
+
+            // Slash commands carry no text. Clear it, or the command would act on the
+            // arguments of the last text command it received.
+            matchingCommand.MessageContext = null;
+            matchingCommand.MessageAuthorId = interaction.User.Id;
             var response = await matchingCommand.Response.PrepareResponse();
 
             if (!response)
@@ -294,7 +348,37 @@ public class DiscordPlatform : IBotPlatform
             return;
         var sentMessage = await _client.Rest.SendMessageAsync(channelId.Value, message);
         if (trackedMessage)
-            _trackedMessages.Add(sentMessage.Id);
+            _trackedMessages[sentMessage.Id] = 0;
+    }
+
+    public async Task SendEmbed(
+        ulong channelId,
+        string? title,
+        string? description,
+        System.Drawing.Color? color = null,
+        string? filePath = null,
+        string? fileName = null
+    )
+    {
+        var embed = new EmbedProperties()
+            .WithTitle(title ?? string.Empty)
+            .WithDescription(description ?? string.Empty);
+        if (color is { } c)
+            embed = embed.WithColor(new Color(c.R, c.G, c.B));
+
+        var hasFile = !string.IsNullOrEmpty(filePath) && !string.IsNullOrEmpty(fileName);
+        // Stays open until the send completes; the attachment reads from it.
+        await using var fileStream = hasFile ? File.OpenRead(filePath!) : null;
+
+        var messageProps = new MessageProperties();
+        if (hasFile)
+        {
+            embed.Image = new EmbedImageProperties($"attachment://{fileName}");
+            messageProps.AddAttachments(new AttachmentProperties(fileName!, fileStream!));
+        }
+        messageProps.AddEmbeds(embed);
+
+        await _client.Rest.SendMessageAsync(channelId, messageProps);
     }
 
     private async Task HandleMessageAsync(Message message)
@@ -312,7 +396,7 @@ public class DiscordPlatform : IBotPlatform
                 if (honeypot.ExemptUserIds.Contains(message.Author.Id))
                 {
                     _logger.Warning(
-                        "Honeypot ACTIVE: exempt user {Username} ({UserId}) posted in honeypot channel {ChannelId} — skipping ban (whitelisted).",
+                        "Honeypot ACTIVE: exempt user {Username} ({UserId}) posted in honeypot channel {ChannelId}: skipping ban (whitelisted).",
                         message.Author.Username,
                         message.Author.Id,
                         message.ChannelId
@@ -351,18 +435,36 @@ public class DiscordPlatform : IBotPlatform
                     );
                 }
 
-                await _client.Rest.BanGuildUserAsync(
-                    message.GuildId.Value,
-                    message.Author.Id,
-                    honeypot.BanDeleteMessageSeconds,
-                    new RestRequestProperties { AuditLogReason = "Auto-ban: posted in honeypot channel." }
-                );
+                // Discord rejects a ban outside this range, so a bad config value can't stop one.
+                var deleteSeconds = Math.Clamp(honeypot.BanDeleteMessageSeconds, 0, 604800);
+                try
+                {
+                    await _client.Rest.BanGuildUserAsync(
+                        message.GuildId.Value,
+                        message.Author.Id,
+                        deleteSeconds,
+                        new RestRequestProperties { AuditLogReason = "Auto-ban: posted in honeypot channel." }
+                    );
+                }
+                catch (Exception ex)
+                {
+                    // Not banned, so the snapshot must not restore roles if they ever rejoin.
+                    _banRestoreStore.TryTake(message.GuildId.Value, message.Author.Id);
+                    _logger.Error(
+                        ex,
+                        "Failed to ban {Username} ({UserId}) for posting in honeypot channel {ChannelId}.",
+                        message.Author.Username,
+                        message.Author.Id,
+                        message.ChannelId
+                    );
+                    return;
+                }
                 _logger.Warning(
                     "Banned {Username} ({UserId}) for posting in honeypot channel {ChannelId}; purged last {Seconds}s of messages.",
                     message.Author.Username,
                     message.Author.Id,
                     message.ChannelId,
-                    honeypot.BanDeleteMessageSeconds
+                    deleteSeconds
                 );
                 return;
             }
@@ -371,19 +473,33 @@ public class DiscordPlatform : IBotPlatform
             if (
                 inReplyTo != null
                 && message.GuildId != null
-                && _trackedMessages.Contains(inReplyTo.Value)
+                && _trackedMessages.ContainsKey(inReplyTo.Value)
             )
             {
-                var guildUser = await _client.Rest.GetGuildUserAsync(
-                    message.GuildId.Value,
-                    message.Author.Id
-                );
-                await guildUser.TimeOutAsync(DateTime.Now.AddMinutes(5));
-                _logger.Warning(
-                    "Timed out {Username} ({UserId}) for replying to a tracked message.",
-                    message.Author.Username,
-                    message.Author.Id
-                );
+                // Some users can't be timed out (e.g. the owner), which must not stop the
+                // rest of this message from being handled.
+                try
+                {
+                    var guildUser = await _client.Rest.GetGuildUserAsync(
+                        message.GuildId.Value,
+                        message.Author.Id
+                    );
+                    await guildUser.TimeOutAsync(DateTimeOffset.UtcNow.AddMinutes(5));
+                    _logger.Warning(
+                        "Timed out {Username} ({UserId}) for replying to a tracked message.",
+                        message.Author.Username,
+                        message.Author.Id
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning(
+                        ex,
+                        "Couldn't time out {Username} ({UserId}) for replying to a tracked message.",
+                        message.Author.Username,
+                        message.Author.Id
+                    );
+                }
             }
 
             if (!message.Content.StartsWith('!'))
@@ -417,27 +533,35 @@ public class DiscordPlatform : IBotPlatform
                 var server = message.Guild?.Name;
 
                 await message.DeleteAsync();
-                var dm = await author.GetDMChannelAsync();
-                await dm.SendMessageAsync(
-                    @$"Whoops! 
-                    
-                    You tried to send a restricted command in the wrong channel in {(server ?? "some server that I couldn't figure out or something, let ggppjj know if you see this")}. 
-                    ""{message.Content}"". 
+                // Users can block DMs. The message is gone by now, so the general error
+                // reply below could not be sent either.
+                try
+                {
+                    var dm = await author.GetDMChannelAsync();
+                    await dm.SendMessageAsync(
+                        @$"Whoops!
+
+                    You tried to send a restricted command in the wrong channel in {(server ?? "some server that I couldn't figure out or something, let ggppjj know if you see this")}.
+                    ""{message.Content}"".
                     You can only send that in channel ID(s) {String.Join(',', matchingCommand.RestrictedToChannelIDs?.Select(i => i.ToString()) ??
                             [
                                 "Unknown!",
                             ])}."
-                );
+                    );
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning(ex, "Couldn't send the wrong channel DM to {UserId}.", author.Id);
+                }
                 return;
             }
 
-            if (
-                matchingCommand.IsAdminCommand
-                && (!matchingCommand.AdminUsers?.Any(i => i.Id == message.Author.Id) ?? false)
-            )
+            if (matchingCommand.IsAdminCommand && !IsAdmin(matchingCommand, message.Author.Id))
             {
                 return;
             }
+
+            using var commandHold = await HoldCommandAsync(matchingCommand);
 
             matchingCommand.MessageContext = message.Content;
             matchingCommand.MessageAuthorId = message.Author.Id;
@@ -551,6 +675,15 @@ public class DiscordPlatform : IBotPlatform
         if (!IsActive)
             return;
 
+        // A skipped user who is back can hold an overwrite again, so re-check their opt-outs.
+        var skippedChannels = _hideSkipStore.RemoveUser(member.Id);
+        foreach (
+            var honeypot in _moderationConfig.Config.Honeypots.Where(h =>
+                skippedChannels.Contains(h.ChannelId)
+            )
+        )
+            await ReconcileHoneypotAsync(honeypot);
+
         var record = _banRestoreStore.TryTake(member.GuildId, member.Id);
         if (record == null)
             return;
@@ -648,14 +781,11 @@ public class DiscordPlatform : IBotPlatform
         return false;
     }
 
-    // The emoji that count as opt-out for this honeypot. For "*", every emoji
-    // currently on the message (custom emoji included via their IDs); otherwise
-    // the single configured unicode emoji.
+    // The emoji currently on the message that count as opt-out for this honeypot: all of
+    // them for "*", otherwise the configured one. Read from the message because fetching a
+    // custom emoji's reactions needs its ID, and the config only holds its name.
     private async Task<List<ReactionEmojiProperties>> GetOptOutEmojisAsync(Honeypot honeypot)
     {
-        if (honeypot.OptOutEmoji != AnyEmojiWildcard)
-            return [new ReactionEmojiProperties(honeypot.OptOutEmoji)];
-
         var message = await _client.Rest.GetMessageAsync(
             honeypot.OptOutMessageChannelId,
             honeypot.OptOutMessageId
@@ -663,7 +793,9 @@ public class DiscordPlatform : IBotPlatform
         return
         [
             .. message
-                .Reactions.Where(r => r.Emoji.Name is not null)
+                .Reactions.Where(r =>
+                    r.Emoji.Name is not null && OptOutEmojiMatches(honeypot, r.Emoji.Name)
+                )
                 .Select(r =>
                     r.Emoji.Id is { } id
                         ? new ReactionEmojiProperties(r.Emoji.Name!, id)
@@ -671,6 +803,8 @@ public class DiscordPlatform : IBotPlatform
                 ),
         ];
     }
+
+    private const int UnknownOverwriteErrorCode = 10009;
 
     // Add a per-user overwrite denying ViewChannel -> channel disappears for them.
     private async Task HideChannelForUserAsync(ulong channelId, ulong userId)
@@ -684,7 +818,20 @@ public class DiscordPlatform : IBotPlatform
                     Denied = Permissions.ViewChannel,
                 }
             );
+            _hideSkipStore.Remove(channelId, userId);
             _logger.Information("Hid channel {ChannelId} for user {UserId}.", channelId, userId);
+        }
+        catch (RestException ex) when (ex.Error?.Code == UnknownOverwriteErrorCode)
+        {
+            // Reactions outlive membership, and Discord answers this way when the target
+            // can't hold an overwrite, which is expected for a user who left the server.
+            // Count it as done so reconciles stop retrying them.
+            _hideSkipStore.Add(channelId, userId);
+            _logger.Warning(
+                "Couldn't hide channel {ChannelId} for user {UserId}: Unknown Overwrite (user may have left the server). Not retrying unless they rejoin or react again.",
+                channelId,
+                userId
+            );
         }
         catch (Exception ex)
         {
@@ -705,6 +852,15 @@ public class DiscordPlatform : IBotPlatform
             await _client.Rest.DeleteGuildChannelPermissionAsync(channelId, userId);
             _logger.Information(
                 "Restored channel {ChannelId} visibility for user {UserId}.",
+                channelId,
+                userId
+            );
+        }
+        catch (RestException ex) when (ex.Error?.Code == UnknownOverwriteErrorCode)
+        {
+            // Nothing to remove, e.g. the hide was skipped because the user had left.
+            _logger.Debug(
+                "No overwrite to remove on channel {ChannelId} for user {UserId}.",
                 channelId,
                 userId
             );
@@ -774,7 +930,13 @@ public class DiscordPlatform : IBotPlatform
                 }
             }
 
-            foreach (var userId in reacted.Where(u => !hiddenNow.Contains(u)))
+            _hideSkipStore.RemoveNotReacting(honeypot.ChannelId, reacted);
+
+            foreach (
+                var userId in reacted.Where(u =>
+                    !hiddenNow.Contains(u) && !_hideSkipStore.Contains(honeypot.ChannelId, u)
+                )
+            )
             {
                 _logger.Information(
                     "Reconcile: applying hide for reacting user {UserId}.",

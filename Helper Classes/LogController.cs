@@ -4,8 +4,7 @@ using Microsoft.Extensions.Primitives;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
-using Serilog.Templates;
-using Serilog.Templates.Themes;
+using Serilog.Sinks.SystemConsole.Themes;
 
 namespace LibMultibot.Helper_Classes;
 
@@ -57,6 +56,10 @@ public class LogController
     private const string BloodRed = "\x1b[38;2;139;0;0m";
     private const string CoolBlue = "\x1b[38;2;80;200;255m";
 
+    // The Code console theme's colours for the timestamp and its brackets.
+    private const string BracketGray = "\x1b[38;5;0242m";
+    private const string TimeGray = "\x1b[38;5;0246m";
+
     private const string Reset = "\x1b[0m";
 
     public static ILogger SetupLogging(
@@ -72,38 +75,78 @@ public class LogController
                 var logLevel = ParseLogLevel(logLevelFromConfig);
                 _levelSwitch = new LoggingLevelSwitch(logLevel);
 
-                var consoleTemplate = new ExpressionTemplate(
-                    "[{@t:HH:mm:ss} "
-                        + "{#if SourceContext = 'HEARTBEAT'}"
-                        + BloodRed
-                        + "HRT"
-                        + Reset
-                        + "{#else}{@l:u3}{#end}]"
-                        + "{#if BotName is not null} {BotName} -{#end} "
-                        + "{#if SourceContext = 'HEARTBEAT'}"
-                        + CoolBlue
-                        + "{SourceContext}: {@m}"
-                        + Reset
-                        + "{#else}{SourceContext}: {@m}{#end}\n{@x}",
-                    theme: TemplateTheme.Code
-                );
+                // Plain output templates, not Serilog.Expressions: that package compiles its
+                // templates at runtime, which is not AOT or trim safe. Conditional parts come
+                // from LogLineEnricher, and the heartbeat's colours from its own console logger.
+                const string consoleTemplate =
+                    "[{Timestamp:HH:mm:ss} {Level:u3}]{BotPrefix:l} "
+                    + "{SourceContext:l}: {Message:l}{NewLine}{Exception}";
+                // All colours are written out here because a theme resets the colour before
+                // each value, which would remove the heartbeat's blue.
+                const string heartbeatRedirectedTemplate =
+                    "[{Timestamp:HH:mm:ss} HRT]{BotPrefix:l} "
+                    + "{SourceContext:l}: {Message:l}{NewLine}{Exception}";
+                const string heartbeatConsoleTemplate =
+                    BracketGray
+                    + "["
+                    + Reset
+                    + TimeGray
+                    + "{Timestamp:HH:mm:ss}"
+                    + Reset
+                    + " "
+                    + BloodRed
+                    + "HRT"
+                    + Reset
+                    + BracketGray
+                    + "]"
+                    + Reset
+                    + "{BotPrefix:l} "
+                    + CoolBlue
+                    + "{SourceContext:l}: {Message:l}"
+                    + Reset
+                    + "{NewLine}{Exception}";
+                const string fileTemplate =
+                    "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {LevelTag:l}]{BotPrefix:l} "
+                    + "{SourceContext:l}: {Message:l}{NewLine}{Exception}";
 
-                var fileTemplate = new ExpressionTemplate(
-                    "[{@t:yyyy-MM-dd HH:mm:ss.fff zzz} "
-                        + "{#if SourceContext = 'HEARTBEAT'}HRT{#else}{@l:u3}{#end}]"
-                        + "{#if BotName is not null} {BotName} -{#end} "
-                        + "{SourceContext}: {@m}\n{@x}"
-                );
-
+                // The enricher goes on each sub-logger because a root enricher runs before
+                // the properties added by ForContext, and would not see them.
                 Log.Logger = new LoggerConfiguration()
                     .MinimumLevel.ControlledBy(_levelSwitch)
-                    .WriteTo.Console(consoleTemplate)
-                    .WriteTo.File(
-                        fileTemplate,
-                        "logs/multibot-.log",
-                        rollingInterval: RollingInterval.Day
+                    .WriteTo.Logger(console =>
+                        console
+                            .Enrich.With<LogLineEnricher>()
+                            .Filter.ByExcluding(IsHeartbeat)
+                            .WriteTo.Console(
+                                outputTemplate: consoleTemplate,
+                                theme: AnsiConsoleTheme.Code
+                            )
+                    )
+                    .WriteTo.Logger(heartbeat =>
+                        heartbeat
+                            .Enrich.With<LogLineEnricher>()
+                            .Filter.ByIncludingOnly(IsHeartbeat)
+                            .WriteTo.Console(
+                                // Written-out colours would otherwise end up in piped output.
+                                outputTemplate: Console.IsOutputRedirected
+                                    ? heartbeatRedirectedTemplate
+                                    : heartbeatConsoleTemplate,
+                                theme: ConsoleTheme.None
+                            )
+                    )
+                    .WriteTo.Logger(file =>
+                        file.Enrich.With<LogLineEnricher>()
+                            .WriteTo.File(
+                                "logs/multibot-.log",
+                                outputTemplate: fileTemplate,
+                                rollingInterval: RollingInterval.Day
+                            )
                     )
                     .CreateLogger();
+
+                // Parsed again because the first parse ran before any logger existed, which
+                // dropped its warning about an unknown level.
+                _ = ParseLogLevel(logLevelFromConfig);
 
                 if (localApplicationConfig != null)
                 {
@@ -135,6 +178,39 @@ public class LogController
         return Log.Logger.ForContext(contextType);
     }
 
+    private static bool IsHeartbeat(LogEvent logEvent) =>
+        logEvent.Properties.TryGetValue("SourceContext", out var context)
+        && context is ScalarValue { Value: "HEARTBEAT" };
+
+    private sealed class LogLineEnricher : ILogEventEnricher
+    {
+        public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
+        {
+            // An output template prints a missing property's name, so this can't be left out.
+            logEvent.AddPropertyIfAbsent(propertyFactory.CreateProperty("SourceContext", ""));
+
+            var botPrefix =
+                logEvent.Properties.TryGetValue("BotName", out var botName)
+                && botName is ScalarValue { Value: string name }
+                    ? $" {name} -"
+                    : "";
+            logEvent.AddOrUpdateProperty(propertyFactory.CreateProperty("BotPrefix", botPrefix));
+
+            var levelTag = IsHeartbeat(logEvent)
+                ? "HRT"
+                : logEvent.Level switch
+                {
+                    LogEventLevel.Verbose => "VRB",
+                    LogEventLevel.Debug => "DBG",
+                    LogEventLevel.Information => "INF",
+                    LogEventLevel.Warning => "WRN",
+                    LogEventLevel.Error => "ERR",
+                    _ => "FTL",
+                };
+            logEvent.AddOrUpdateProperty(propertyFactory.CreateProperty("LevelTag", levelTag));
+        }
+    }
+
     private static LogEventLevel ParseLogLevel(string? value) =>
         Enum.TryParse<LogEventLevel>(value, true, out var level) && Enum.IsDefined(level)
             ? level
@@ -153,14 +229,19 @@ public class LogController
     {
         var heartbeatLogger = Log.Logger.ForContext("SourceContext", "HEARTBEAT");
 
-        var now = DateTime.Now;
-        var nextHour = now.Date.AddHours(now.Hour + 1);
-        var delay = nextHour - now;
+        // Recalculated on each tick: a fixed one-hour interval would drift off the hour.
+        static double MsUntilNextHour()
+        {
+            var now = DateTime.Now;
+            // A timer firing just before the hour must not count that same hour as next.
+            var soon = now.AddSeconds(1);
+            return (soon.Date.AddHours(soon.Hour + 1) - now).TotalMilliseconds;
+        }
 
-        var timer = new System.Timers.Timer(delay.TotalMilliseconds) { AutoReset = true };
+        var timer = new System.Timers.Timer(MsUntilNextHour()) { AutoReset = true };
         timer.Elapsed += (s, e) =>
         {
-            timer.Interval = TimeSpan.FromHours(1).TotalMilliseconds;
+            timer.Interval = MsUntilNextHour();
             heartbeatLogger.Information("{Lyric}", _lyrics[_lyricIndex]);
             _lyricIndex = (_lyricIndex + 1) % _lyrics.Length;
         };
