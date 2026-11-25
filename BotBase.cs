@@ -9,10 +9,23 @@ public abstract class BotBase : IBot
     public abstract string Name { get; }
     public List<IBotCommand> Commands { get; } = [];
     public List<IBotScheduledMessage>? ScheduledMessages { get; } = [];
+    public List<IBotMessageListener> MessageListeners { get; } = [];
     public bool IsActive { get; set; } = true;
     public CancellationToken CancellationToken { get; set; }
+    public Task<bool> Stopped => _stopped.Task;
 
     private readonly List<IBotPlatform> _platforms = [];
+
+    // Guards _platforms and _hasStopped: the bot can be stopped while Init is still
+    // starting platforms.
+    private readonly Lock _platformLock = new();
+    private bool _hasStopped;
+    private readonly TaskCompletionSource<bool> _stopped = new(
+        TaskCreationOptions.RunContinuationsAsynchronously
+    );
+
+    // Cancelled when this bot stops or the process shuts down, whichever is first.
+    private readonly CancellationTokenSource _botCts;
     protected readonly ILogger _logger;
     private readonly CancellationTokenSource _shutdownSource;
 
@@ -28,7 +41,8 @@ public abstract class BotBase : IBot
     protected BotBase(CancellationTokenSource shutdownSource)
     {
         _shutdownSource = shutdownSource;
-        CancellationToken = shutdownSource.Token;
+        _botCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownSource.Token);
+        CancellationToken = _botCts.Token;
         _logger = LogController.SetupLogging(GetType());
     }
 
@@ -43,9 +57,28 @@ public abstract class BotBase : IBot
             foreach (var platform in CreatePlatforms())
             {
                 await platform.StartAsync();
-                _platforms.Add(platform);
+                bool failed;
+                lock (_platformLock)
+                {
+                    failed = _hasStopped;
+                    if (!failed)
+                        _platforms.Add(platform);
+                }
+                if (failed)
+                {
+                    await platform.Shutdown();
+                    return false;
+                }
             }
             _logger.Information("Started.");
+            try
+            {
+                await OnStarted();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Error in the bot's startup step.");
+            }
             return true;
         }
         catch (InvalidDataException e)
@@ -53,6 +86,45 @@ public abstract class BotBase : IBot
             _logger.Fatal(e.Message);
             throw;
         }
+    }
+
+    /// <summary>Runs once every platform has started. A failure here does not stop the bot.</summary>
+    protected virtual Task OnStarted() => Task.CompletedTask;
+
+    private List<IBotPlatform> PlatformsSnapshot()
+    {
+        lock (_platformLock)
+            return [.. _platforms];
+    }
+
+    // Stops this bot only. Other bots in the process keep running.
+    private async Task StopAsync(bool failed)
+    {
+        List<IBotPlatform> toStop;
+        lock (_platformLock)
+        {
+            if (_hasStopped)
+                return;
+            _hasStopped = true;
+            toStop = [.. _platforms];
+            _platforms.Clear();
+        }
+        IsActive = false;
+        // Ends this bot's background work, such as command preloading.
+        _botCts.Cancel();
+        foreach (var platform in toStop)
+        {
+            try
+            {
+                await platform.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, $"Error shutting down platform '{platform.Name}'.");
+            }
+        }
+        _stopped.TrySetResult(failed);
+        _logger.Information("Stopped.");
     }
 
     private void StartCommandInits()
@@ -66,8 +138,8 @@ public abstract class BotBase : IBot
         var results = await Task.WhenAll(commandInitTasks);
         if (commandInitTasks.Count > 0 && results.All(r => !r))
         {
-            _logger.Fatal("All commands failed to initialize. Requesting shutdown.");
-            await RequestShutdown();
+            _logger.Fatal("All commands failed to initialize. Stopping this bot.");
+            await StopAsync(failed: true);
         }
     }
 
@@ -143,7 +215,7 @@ public abstract class BotBase : IBot
         bool trackedMessage = false
     )
     {
-        foreach (var platform in _platforms)
+        foreach (var platform in PlatformsSnapshot())
             await platform.SendMessage(message, channelId, trackedMessage);
     }
 
@@ -158,15 +230,23 @@ public abstract class BotBase : IBot
     {
         // Platforms join this list once started. Fail rather than silently send nowhere, so
         // a caller doesn't count a post made during startup as delivered.
-        if (_platforms.Count == 0)
+        var platforms = PlatformsSnapshot();
+        if (platforms.Count == 0)
             throw new InvalidOperationException("No platforms are running.");
 
-        foreach (var platform in _platforms)
+        foreach (var platform in platforms)
             await platform.SendEmbed(channelId, title, description, color, filePath, fileName);
     }
 
-    public Task RequestShutdown()
+    public Task RequestBotShutdown()
     {
+        _logger.Warning("Shutdown of this bot requested.");
+        return StopAsync(failed: false);
+    }
+
+    public Task RequestProcessShutdown()
+    {
+        _logger.Warning("Shutdown of the whole process requested.");
         _shutdownSource.Cancel();
         return Task.CompletedTask;
     }
@@ -174,7 +254,7 @@ public abstract class BotBase : IBot
     public virtual async Task Shutdown()
     {
         _logger.Information("Shutting down...");
-        await Task.WhenAll(_platforms.Select(p => p.Shutdown()));
+        await Task.WhenAll(PlatformsSnapshot().Select(p => p.Shutdown()));
         _logger.Information("Shutdown complete.");
     }
 }

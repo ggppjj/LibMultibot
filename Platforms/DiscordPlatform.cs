@@ -43,13 +43,15 @@ public class DiscordPlatform : IBotPlatform
     private readonly BanRestoreStore _banRestoreStore;
     private readonly HideSkipStore _hideSkipStore;
     private volatile bool _isReady;
+    private ulong _selfUserId;
 
     public event CommandEventHandler? OnCommand;
 
     public DiscordPlatform(IBot bot)
     {
         Bot = bot;
-        _logger = LogController.SetupLogging(typeof(DiscordPlatform));
+        // Tagged with the bot's name: each bot has its own platform, and they log the same lines.
+        _logger = LogController.SetupLogging(typeof(DiscordPlatform)).ForContext("BotName", bot.Name);
         _logger.Information($"Starting for {Bot.Name}...");
 
         if (!File.Exists(_tokenFilePath))
@@ -75,21 +77,23 @@ public class DiscordPlatform : IBotPlatform
         _token = _tokenConfig[Bot.Name];
         if (string.IsNullOrWhiteSpace(_token) || _token == "YOUR_DISCORD_BOT_TOKEN_HERE")
         {
-            _logger.Fatal("Missing bot token in DiscordTokens.json file!");
-            throw new InvalidDataException("Missing bot token!");
+            _logger.Fatal($"Missing bot token for '{Bot.Name}' in DiscordTokens.json file!");
+            throw new InvalidDataException($"Missing bot token for '{Bot.Name}'!");
         }
+
+        var intents =
+            GatewayIntents.Guilds
+            | GatewayIntents.GuildMessages
+            | GatewayIntents.MessageContent
+            | GatewayIntents.GuildMessageReactions
+            | GatewayIntents.GuildUsers;
+        // Only message listeners handle direct messages, so other bots don't receive them.
+        if (Bot.MessageListeners.Count > 0)
+            intents |= GatewayIntents.DirectMessages;
 
         _client = new GatewayClient(
             new BotToken(_token),
-            new GatewayClientConfiguration
-            {
-                Intents =
-                    GatewayIntents.Guilds
-                    | GatewayIntents.GuildMessages
-                    | GatewayIntents.MessageContent
-                    | GatewayIntents.GuildMessageReactions
-                    | GatewayIntents.GuildUsers,
-            }
+            new GatewayClientConfiguration { Intents = intents }
         );
 
         _moderationConfig = new ModerationCommandConfig(Bot.Name, "Moderation", _logger);
@@ -502,7 +506,10 @@ public class DiscordPlatform : IBotPlatform
                 }
             }
 
-            if (!message.Content.StartsWith('!'))
+            await DispatchToListenersAsync(message);
+
+            // Text commands are for servers. Direct messages go to listeners only.
+            if (message.GuildId == null || !message.Content.StartsWith('!'))
                 return;
 
             var commandText = new string(
@@ -632,6 +639,54 @@ public class DiscordPlatform : IBotPlatform
             {
                 _logger.Error(replyEx, "Failed to send error response.");
             }
+        }
+    }
+
+    private async Task DispatchToListenersAsync(Message message)
+    {
+        if (Bot.MessageListeners.Count == 0)
+            return;
+
+        var author = message.Author;
+        var botMessage = new BotMessage(
+            author.Id,
+            author.Username,
+            (author as GuildUser)?.Nickname ?? author.GlobalName ?? author.Username,
+            message.ChannelId,
+            message.GuildId,
+            message.Content,
+            Interlocked.Read(ref _selfUserId)
+        );
+
+        foreach (var listener in Bot.MessageListeners)
+        {
+            if (!listener.IsActive)
+                continue;
+            // One listener failing must not stop the others, or the text command after them.
+            try
+            {
+                await listener.OnMessage(botMessage, this);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Message listener '{Listener}' failed.", listener.Name);
+            }
+        }
+    }
+
+    public async Task<bool> SendDirectMessage(ulong userId, string message)
+    {
+        try
+        {
+            var dm = await _client.Rest.GetDMChannelAsync(userId);
+            await _client.Rest.SendMessageAsync(dm.Id, message);
+            return true;
+        }
+        catch (RestException ex)
+        {
+            // Expected for users who block DMs or share no server with the bot.
+            _logger.Warning(ex, "Couldn't send a direct message to {UserId}.", userId);
+            return false;
         }
     }
 
@@ -981,6 +1036,7 @@ public class DiscordPlatform : IBotPlatform
 
     private async Task OnClientReady(ReadyEventArgs args)
     {
+        Interlocked.Exchange(ref _selfUserId, args.User.Id);
         try
         {
             var existingCommands = await _client.Rest.GetGlobalApplicationCommandsAsync(

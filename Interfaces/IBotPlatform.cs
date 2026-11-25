@@ -8,6 +8,9 @@ public interface IBotPlatform
     Task StartAsync();
     Task Shutdown();
     Task SendMessage(string message, ulong? channelId, bool trackedMessage = false);
+
+    /// <summary>Returns false if the user could not be messaged, e.g. they block DMs.</summary>
+    Task<bool> SendDirectMessage(ulong userId, string message);
     Task SendEmbed(
         ulong channelId,
         string? title,

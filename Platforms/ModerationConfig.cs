@@ -74,19 +74,7 @@ internal class ModerationCommandConfig(string botName, string commandName, ILogg
 
     protected override void OnConfigLoaded() => Reloaded?.Invoke();
 
-    protected override ModerationConfig CreateDefaultConfig() =>
-        new()
-        {
-            Honeypots =
-            [
-                new Honeypot
-                {
-                    ChannelId = 1518310706049454211, // honeypot channel
-                    ExemptUserIds = [142829604330143744], // ggppjj
-                    OptOutMessageId = 1518310530744324156, // explainer message
-                    OptOutMessageChannelId = 898653215371968532, // channel holding it
-                    OptOutEmoji = "👍",
-                },
-            ],
-        };
+    // No honeypots by default. A honeypot bans people, so one only exists once it has been
+    // written into the bot's Moderation.json by hand.
+    protected override ModerationConfig CreateDefaultConfig() => new();
 }
